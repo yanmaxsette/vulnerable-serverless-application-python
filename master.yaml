@@ -2,43 +2,29 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: A Serverless Application to demo Cloud One Application Security.
 
 Parameters:
-  C1RegionEndpoint:
+  C1API:
     Type: String
-    Default: "https://agents.us-1.application.cloudone.trendmicro.com/"
-    Description: Enter the Cloud One Account Region Endpoint.
-  AppSecKey:
+    NoEcho: true
+    Description: Enter your Cloud One API Key
+  Endpoint:
+    Default: 'antimalware.us-1.cloudone.trendmicro.com:443'
+    Description: Trend Endpoint.
     Type: String
-    Default: ""
-    Description: Enter the Security Group Key. You can find it at https://cloudone.trendmicro.com/application#/policies
-  AppSecSecret:
+  S3BucketName:
+    Description: S3 bucket name containing the python.zip file
     Type: String
-    Default: ""
-    Description: Enter the Security Group Secret. You can find it at https://cloudone.trendmicro.com/application#/policies
-
-Metadata: 
-  AWS::CloudFormation::Interface: 
-    ParameterGroups: 
-      - 
-        Label: 
-          default: "Security Group Data"
-        Parameters: 
-          - AppSecKey
-          - AppSecSecret
-      - 
-        Label: 
-          default: "Cloud One Regional Setting"
-        Parameters: 
-          - C1RegionEndpoint
-    ParameterLabels:
-      C1RegionEndpoint:
-        default: Cloud One Account Region Endpoint. Defaults to https://agents.us-1.application.cloudone.trendmicro.com/
-      AppSecKey:
-        default: Security Group Key
-      AppSecSecret:
-        default: Security Group Secret
+  S3Key:
+    Default: 'python.zip'
+    Description: zip file name
+    Type: String
 
 Resources:
 
+  c1api:
+    Type: AWS::SecretsManager::Secret
+    Properties: 
+      Description: C1 API KEY
+      SecretString: !Sub '{"c1apikey":"${C1API}"}'
   S3Bucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -63,6 +49,20 @@ Resources:
                 - !Ref S3Bucket
                 - /*
       Bucket: !Ref S3Bucket
+
+  LambdaLibLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - arm64
+        - x86_64
+      CompatibleRuntimes:
+        - python3.7
+      Content:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref S3Key
+      Description: Libs
+      LayerName: !Join ["-",[!Ref AWS::StackName, "lib-layer"]]
 
   ApiGateway:
     Type: "AWS::ApiGateway::RestApi"
@@ -220,16 +220,8 @@ Resources:
     Type: "AWS::Lambda::Function"
     Properties:
       Description: "Simple API Gateway Handler"
-      Environment:
-        Variables:
-          TREND_AP_READY_TIMEOUT: 30
-          TREND_AP_KEY: !Ref AppSecKey
-          TREND_AP_SECRET: !Ref AppSecSecret
-          TREND_AP_HELLO_URL: !Ref C1RegionEndpoint
-          AWS_LAMBDA_EXEC_WRAPPER: "/opt/trend_app_protect"
       Runtime: python3.8
       Handler: index.handler
-      Layers: [!Sub "arn:aws:lambda:${AWS::Region}:800880067056:layer:CloudOne-ApplicationSecurity-python:1"]
       Code:
         ZipFile: |
           def handler(event, context):
@@ -354,6 +346,10 @@ Resources:
             Action:
             - "s3:*"
             Resource: "*"
+          - Effect: Allow
+            Action:
+              - "secretsmanager:GetSecretValue"     
+            Resource: !Ref c1api
 
   MfuLambdaFunction:
     Type: AWS::Lambda::Function
@@ -361,14 +357,12 @@ Resources:
       Description: "Handle Malicious File Upload Execution"
       Environment:
         Variables:
-          TREND_AP_KEY: !Ref AppSecKey
-          TREND_AP_SECRET: !Ref AppSecSecret
-          TREND_AP_HELLO_URL: !Ref C1RegionEndpoint
-          BUCKET_NAME: !Ref S3Bucket
-          AWS_LAMBDA_EXEC_WRAPPER: "/opt/trend_app_protect"
-      Runtime: python3.8
+          API_KEY: !Ref c1api
+          ENDPOINT: !Ref Endpoint
+      Runtime: python3.7
       Handler: index.lambda_handler
-      Layers: [!Sub "arn:aws:lambda:${AWS::Region}:800880067056:layer:CloudOne-ApplicationSecurity-python:1"]
+      Layers:
+        - !Ref LambdaLibLayer
       Role: !GetAtt
         - mfulambdarole
         - Arn
@@ -376,59 +370,82 @@ Resources:
         ZipFile: |
           import json
           import base64
+          import email
+          import time
           import boto3
           import os
-          import email
-          
-          bucket_name = os.environ["BUCKET_NAME"]
+
+          import amaas.grpc
+
+          api_key = os.environ["API_KEY"]
+          endpoint = os.environ["ENDPOINT"]
 
           def lambda_handler(event, context):
-              print(event)
-              file_data = base64.b64decode(event['body'])
-              print(file_data)
+              # get secret
+              secrets = boto3.client("secretsmanager").get_secret_value(SecretId=api_key)
+              sm_data = json.loads(secrets["SecretString"])
+              apikey = sm_data["c1apikey"]
+
+              file_data = base64.b64decode(event["body"])
               try:
-                  content_type = event["headers"]['Content-Type']
+                  content_type = event["headers"]["Content-Type"]
               except:
-                  content_type = event["headers"]['content-type']
-              
-              ct = "Content-Type: "+content_type+"\n"
-              # parsing message from bytes
-              msg = email.message_from_bytes(ct.encode()+file_data)
-              print(msg)
-              
+                  content_type = event["headers"]["content-type"]
+
+              ct = "Content-Type: " + content_type + "\n"
+
+              msg = email.message_from_bytes(ct.encode() + file_data)
+
               print("Multipart check : ", msg.is_multipart())
-              
-              # if message is multipart
+
               if msg.is_multipart():
                   multipart_content = {}
-                  # retrieving form-data
                   for part in msg.get_payload():
-                      # checking if filename exist as a part of content-disposition header
                       if part.get_filename():
-                          # fetching the filename
                           file_name = part.get_filename()
                           print(file_name)
-                      multipart_content[part.get_param('name', header='content-disposition')] = part.get_payload(decode=True)
-                      print(multipart_content)
+                      multipart_content[
+                          part.get_param("name", header="content-disposition")
+                      ] = part.get_payload(decode=True)
+
+                      file_path = "/tmp/" + file_name
+                      with open(file_path, "wb") as f:
+                          f.write(multipart_content["filename"])
                   try:
-                    s3 = boto3.client("s3")
-                    #u uploading file to S3
-                    s3_upload = s3.put_object(Bucket=bucket_name, Key=file_name, Body=multipart_content["filename"]) 
-                    return {
-                        'statusCode': 200,
-                        'headers': {
-                          'Access-Control-Allow-Origin': '*'
-                        },
-                        'body': json.dumps('File uploaded successfully!')
-                    }
-                  except:
-                    return {
-                        'statusCode': 200,
-                        'headers': {
-                          'Access-Control-Allow-Origin': '*'
-                        },
-                        'body': json.dumps('No File has been attached!')
-                    }
+                      handle = amaas.grpc.init(
+                          endpoint,
+                          apikey,
+                          True,
+                      )
+                      s = time.perf_counter()
+                      result = amaas.grpc.scan_file(file_path, handle)
+
+                      elapsed = time.perf_counter() - s
+
+                      print("Elapsed")
+                      print(f"scan executed in {elapsed:0.2f} seconds.")
+
+                      amaas.grpc.quit(handle)
+
+                      print(result)
+
+                      if json.loads(result)["scanResult"] == 0:
+                          msg = "Clean file!"
+                      else:
+                          msg = "Infected file!"
+
+                      return {
+                          "statusCode": 200,
+                          "headers": {"Access-Control-Allow-Origin": "*"},
+                          "body": json.dumps(msg),
+                      }
+                  except Exception as e:
+                      return {
+                          "statusCode": 200,
+                          "headers": {"Access-Control-Allow-Origin": "*"},
+                          "body": json.dumps(str(e)),
+                      }
+
       MemorySize: 512
       Timeout: 500
   
@@ -482,15 +499,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       Description: "Handle Remote Code Execution"
-      Environment:
-        Variables:
-          TREND_AP_KEY: !Ref AppSecKey
-          TREND_AP_SECRET: !Ref AppSecSecret
-          TREND_AP_HELLO_URL: !Ref C1RegionEndpoint
-          AWS_LAMBDA_EXEC_WRAPPER: "/opt/trend_app_protect"
       Runtime: python3.8
       Handler: index.lambda_handler
-      Layers: [!Sub "arn:aws:lambda:${AWS::Region}:800880067056:layer:CloudOne-ApplicationSecurity-python:1"]
       Role: !GetAtt
         - rcelambdarole
         - Arn
